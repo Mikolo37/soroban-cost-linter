@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -458,12 +458,101 @@ fn resolve_path(path: &str) -> PathBuf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `docs/SUMMARY.md` coverage
+// ---------------------------------------------------------------------------
+
+/// A lint link found in the `docs/SUMMARY.md` table of contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SummaryLink {
+    /// The file stem of the target, e.g. `host_in_loop` for
+    /// `lints/host_in_loop.md`.
+    stem: String,
+    /// The target as written in the summary, e.g. `lints/host_in_loop.md`.
+    target: String,
+}
+
+/// Parse the lint links out of a `docs/SUMMARY.md` table of contents.
+///
+/// Only links that point into `lints/` are collected: the summary also links
+/// to hand-written pages (`lint_catalog.md`, `integration.md`, ...) that are
+/// not lint pages. `lints/README.md` is the generated lint *reference* index,
+/// not a lint page, so it is skipped as well.
+fn parse_summary_links(summary: &str) -> Vec<SummaryLink> {
+    let mut links = Vec::new();
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("* [") else {
+            continue;
+        };
+        let Some((_, rest)) = rest.split_once("](") else {
+            continue;
+        };
+        let Some((target, _)) = rest.split_once(')') else {
+            continue;
+        };
+        let target = target.trim();
+        let Some(stem) = target
+            .strip_prefix("lints/")
+            .and_then(|rest| rest.strip_suffix(".md"))
+        else {
+            continue;
+        };
+        if stem == "README" {
+            continue;
+        }
+        links.push(SummaryLink {
+            stem: stem.to_string(),
+            target: target.to_string(),
+        });
+    }
+    links
+}
+
+/// Registered lints that `docs/SUMMARY.md` does not link to.
+///
+/// A shipped lint whose page is unreachable from the docs sidebar is a page
+/// no reader ever finds, so the summary has to carry one entry per registered
+/// lint.
+fn summary_missing_lints(entries: &[LintEntry], summary: &str) -> Vec<String> {
+    let links = parse_summary_links(summary);
+    let linked: HashSet<&str> = links.iter().map(|link| link.stem.as_str()).collect();
+    entries
+        .iter()
+        .map(|entry| entry.name_doc.clone())
+        .filter(|name| !linked.contains(name.as_str()))
+        .collect()
+}
+
+/// Lints that `docs/SUMMARY.md` links to more than once.
+fn summary_duplicate_lints(summary: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut duplicates: Vec<String> = Vec::new();
+    for link in parse_summary_links(summary) {
+        if !seen.insert(link.stem.clone()) && !duplicates.contains(&link.stem) {
+            duplicates.push(link.stem);
+        }
+    }
+    duplicates
+}
+
+/// Summary links whose target page does not exist on disk.
+fn summary_broken_links(summary: &str, docs_dir: &Path) -> Vec<String> {
+    parse_summary_links(summary)
+        .iter()
+        .filter(|link| !docs_dir.join(&link.target).exists())
+        .map(|link| link.target.clone())
+        .collect()
+}
+
 fn main() {
     let check_mode = std::env::args().any(|a| a == "--check");
 
     let lib_path = resolve_path("soroban_cost_lints/src/lib.rs");
     let readme_path = resolve_path("docs/lints/README.md");
     let catalog_path = resolve_path("docs/lint_catalog.md");
+    let summary_path = resolve_path("docs/SUMMARY.md");
+    let docs_dir = resolve_path("docs");
 
     if !lib_path.exists() {
         eprintln!(
@@ -497,6 +586,40 @@ fn main() {
             eprintln!("❌ docs/lint_catalog.md is out of date. Run `cargo run -p generate-lint-docs` from workspace root to regenerate.");
             exit_code = 1;
         }
+
+        // The GitBook table of contents is hand-written, so nothing else keeps
+        // it in step with the shipped lint set. Check it here, next to the
+        // generated files it has to agree with.
+        let summary = fs::read_to_string(&summary_path).unwrap_or_default();
+        let missing = summary_missing_lints(&entries, &summary);
+        if !missing.is_empty() {
+            eprintln!(
+                "❌ docs/SUMMARY.md does not link every registered lint: {}. Add a \
+                 `  * [lint_name](lints/lint_name.md)` entry under the \"Lints\" chapter, in the \
+                 same order as docs/lint_catalog.md.",
+                missing.join(", ")
+            );
+            exit_code = 1;
+        }
+        let duplicates = summary_duplicate_lints(&summary);
+        if !duplicates.is_empty() {
+            eprintln!(
+                "❌ docs/SUMMARY.md links the same lint more than once: {}. Keep exactly one \
+                 entry per lint.",
+                duplicates.join(", ")
+            );
+            exit_code = 1;
+        }
+        let broken = summary_broken_links(&summary, &docs_dir);
+        if !broken.is_empty() {
+            eprintln!(
+                "❌ docs/SUMMARY.md links to pages that do not exist: {}. Either add the page \
+                 or drop the entry.",
+                broken.join(", ")
+            );
+            exit_code = 1;
+        }
+
         if exit_code != 0 {
             process::exit(exit_code);
         }
@@ -1077,6 +1200,9 @@ multiline description"
         let catalog_path = root.join("docs/lint_catalog.md");
         fs::write(&catalog_path, generate_catalog(&entries)).unwrap();
 
+        write_lint_page(root, "soroban_storage_in_loop");
+        write_summary(root, &["soroban_storage_in_loop"]);
+
         let status = Command::new(&bin)
             .args(["--check", "--workspace-root", root.to_str().unwrap()])
             .status()
@@ -1084,6 +1210,211 @@ multiline description"
         assert!(
             status.success(),
             "--check should pass when all generated files match"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // docs/SUMMARY.md coverage
+    // ------------------------------------------------------------------
+
+    /// Write a placeholder page for `lint_name` under `docs/lints/`.
+    fn write_lint_page(root: &Path, lint_name: &str) {
+        let path = root.join(format!("docs/lints/{lint_name}.md"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("# {lint_name}\n")).unwrap();
+    }
+
+    /// Write a `docs/SUMMARY.md` whose "Lints" chapter links `lint_names`.
+    fn write_summary(root: &Path, lint_names: &[&str]) {
+        let mut md = String::from("# Table of contents\n\n## Lints\n\n");
+        md.push_str("* [Lint Catalog](lint_catalog.md)\n");
+        md.push_str("* [Lint Reference](lints/README.md)\n");
+        for name in lint_names {
+            md.push_str(&format!("  * [{name}](lints/{name}.md)\n"));
+        }
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/SUMMARY.md"), md).unwrap();
+    }
+
+    /// A fake workspace whose generated files, summary and pages all agree.
+    fn consistent_workspace(root: &Path) {
+        let fake_lib = root.join("soroban_cost_lints/src/lib.rs");
+        fs::create_dir_all(fake_lib.parent().unwrap()).unwrap();
+        fs::write(&fake_lib, SINGLE_LINT).unwrap();
+
+        let entries = parse_lib_rs(SINGLE_LINT);
+        let readme_path = root.join("docs/lints/README.md");
+        fs::create_dir_all(readme_path.parent().unwrap()).unwrap();
+        fs::write(&readme_path, generate_readme(&entries)).unwrap();
+        fs::write(
+            root.join("docs/lint_catalog.md"),
+            generate_catalog(&entries),
+        )
+        .unwrap();
+
+        write_lint_page(root, "soroban_storage_in_loop");
+        write_summary(root, &["soroban_storage_in_loop"]);
+    }
+
+    #[test]
+    fn check_mode_fails_when_summary_omits_a_registered_lint() {
+        let bin = find_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        consistent_workspace(root);
+        // The page exists, but the table of contents no longer reaches it.
+        write_summary(root, &[]);
+
+        let status = Command::new(&bin)
+            .args(["--check", "--workspace-root", root.to_str().unwrap()])
+            .status()
+            .expect("Failed to execute binary");
+        assert!(
+            !status.success(),
+            "--check should fail when a registered lint is missing from docs/SUMMARY.md"
+        );
+    }
+
+    #[test]
+    fn check_mode_fails_when_summary_links_a_page_that_does_not_exist() {
+        let bin = find_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        consistent_workspace(root);
+        write_summary(root, &["soroban_storage_in_loop", "never_shipped"]);
+
+        let status = Command::new(&bin)
+            .args(["--check", "--workspace-root", root.to_str().unwrap()])
+            .status()
+            .expect("Failed to execute binary");
+        assert!(
+            !status.success(),
+            "--check should fail when docs/SUMMARY.md links a page that does not exist"
+        );
+    }
+
+    #[test]
+    fn check_mode_fails_when_summary_links_a_lint_twice() {
+        let bin = find_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        consistent_workspace(root);
+        write_summary(
+            root,
+            &["soroban_storage_in_loop", "soroban_storage_in_loop"],
+        );
+
+        let status = Command::new(&bin)
+            .args(["--check", "--workspace-root", root.to_str().unwrap()])
+            .status()
+            .expect("Failed to execute binary");
+        assert!(
+            !status.success(),
+            "--check should fail when docs/SUMMARY.md links the same lint twice"
+        );
+    }
+
+    #[test]
+    fn parse_summary_links_collects_only_lint_pages() {
+        let summary = "\
+# Table of contents
+
+## Lints
+
+* [Lint Catalog](lint_catalog.md)
+* [Lint Reference](lints/README.md)
+  * [host\\_in\\_loop](lints/host_in_loop.md)
+  * [large\\_constant\\_array](lints/large_constant_array.md)
+";
+        let links = parse_summary_links(summary);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].stem, "host_in_loop");
+        assert_eq!(links[0].target, "lints/host_in_loop.md");
+        assert_eq!(links[1].stem, "large_constant_array");
+    }
+
+    #[test]
+    fn summary_missing_lints_reports_unlinked_lints() {
+        let entries = parse_lib_rs(TWO_LINTS);
+        let summary = "  * [soroban\\_storage\\_in\\_loop](lints/soroban_storage_in_loop.md)\n";
+        let missing = summary_missing_lints(&entries, summary);
+        assert_eq!(missing, vec!["redundant_env_clone".to_string()]);
+    }
+
+    #[test]
+    fn summary_missing_lints_is_empty_when_every_lint_is_linked() {
+        let entries = parse_lib_rs(TWO_LINTS);
+        let summary = "\
+  * [soroban\\_storage\\_in\\_loop](lints/soroban_storage_in_loop.md)
+  * [redundant\\_env\\_clone](lints/redundant_env_clone.md)
+";
+        assert!(summary_missing_lints(&entries, summary).is_empty());
+    }
+
+    #[test]
+    fn summary_duplicate_lints_reports_repeated_entries() {
+        let summary = "\
+  * [soroban\\_storage\\_in\\_loop](lints/soroban_storage_in_loop.md)
+  * [soroban\\_storage\\_in\\_loop](lints/soroban_storage_in_loop.md)
+  * [redundant\\_env\\_clone](lints/redundant_env_clone.md)
+";
+        assert_eq!(
+            summary_duplicate_lints(summary),
+            vec!["soroban_storage_in_loop".to_string()]
+        );
+    }
+
+    #[test]
+    fn summary_broken_links_reports_missing_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_lint_page(root, "soroban_storage_in_loop");
+
+        let summary = "\
+  * [soroban\\_storage\\_in\\_loop](lints/soroban_storage_in_loop.md)
+  * [never\\_shipped](lints/never_shipped.md)
+";
+        assert_eq!(
+            summary_broken_links(summary, &root.join("docs")),
+            vec!["lints/never_shipped.md".to_string()]
+        );
+    }
+
+    /// Pins the hand-written table of contents against the real `lib.rs`:
+    /// every shipped lint has to be reachable from the docs sidebar, exactly
+    /// once, and every entry has to point at a page that exists.
+    #[test]
+    fn golden_summary_links_every_registered_lint() {
+        let ws = workspace_root();
+        let content = fs::read_to_string(ws.join("soroban_cost_lints/src/lib.rs"))
+            .expect("Failed to read lib.rs — run from workspace root");
+        let entries = parse_lib_rs(&content);
+        assert!(!entries.is_empty(), "no lints parsed from lib.rs");
+
+        let summary =
+            fs::read_to_string(ws.join("docs/SUMMARY.md")).expect("Failed to read docs/SUMMARY.md");
+        let missing = summary_missing_lints(&entries, &summary);
+        assert!(
+            missing.is_empty(),
+            "docs/SUMMARY.md does not link these registered lints: {:?}",
+            missing
+        );
+
+        let duplicates = summary_duplicate_lints(&summary);
+        assert!(
+            duplicates.is_empty(),
+            "docs/SUMMARY.md links these lints more than once: {:?}",
+            duplicates
+        );
+
+        let broken = summary_broken_links(&summary, &ws.join("docs"));
+        assert!(
+            broken.is_empty(),
+            "docs/SUMMARY.md links to pages that do not exist: {:?}",
+            broken
         );
     }
 

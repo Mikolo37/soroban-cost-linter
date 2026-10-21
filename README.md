@@ -25,7 +25,7 @@ Writing `env.storage().instance().set()` inside a `for` loop is mathematically g
 
 ## Features
 
-The linter hooks into the Rust compiler's AST to catch specific Soroban anti-patterns. 35 lints ship in `v0.1.1`:
+The linter runs as a Dylint library against the Rust compiler's HIR to catch specific Soroban anti-patterns (with a single early AST pass for the `format_args!` nodes the HIR no longer exposes). 35 lints ship in `v0.1.1`:
 
 *   **[`soroban_storage_in_loop`](docs/lints/soroban_storage_in_loop.md):** Flags storage read/write operations placed inside loop bodies, suggesting memory aggregation instead.
 *   **[`redundant_env_clone`](docs/lints/redundant_env_clone.md):** Detects unnecessary `.clone()` calls on the Soroban `Env` object.
@@ -82,7 +82,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for full setup details, including a manua
 > covered in the same page; **Visual Studio Build Tools is required** because
 > the MSVC `rustc` toolchain needs `link.exe` (which Build Tools provides).
 
-Since `soroban-cost-linter` hooks directly into Rust's AST, it relies on [Dylint](https://github.com/trailofbits/dylint) to run dynamic library lints. The linter library requires Dylint version `^6.0.1`.
+Since `soroban-cost-linter` hooks directly into Rust's HIR, it relies on [Dylint](https://github.com/trailofbits/dylint) to run dynamic library lints. The linter library requires Dylint version `^6.0.1`.
 
 1. **Install the pinned nightly toolchain** — see the [`rust-toolchain`](rust-toolchain) file for the exact channel (as of this writing, the CI uses `nightly-2026-04-16`).
 
